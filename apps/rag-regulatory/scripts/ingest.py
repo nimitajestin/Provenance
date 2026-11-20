@@ -11,22 +11,32 @@ import pdfplumber
 import requests
 import yaml
 from bs4 import BeautifulSoup
-from qdrant_client.http.models import PointStruct
+from qdrant_client.http.models import (
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PointStruct,
+)
 
 from src.config import QDRANT_COLLECTION
 from src.rag.embeddings import embed
 from src.rag.retrieval import client, ensure_collection
+from src.rag.text import chunk_pages, strip_repeated_lines
 
 
-def chunk_text(text, size=900, overlap=120):
-    chunks = []
-    start = 0
-    while start < len(text):
-        chunk = text[start:start + size].strip()
-        if len(chunk) >= 80:
-            chunks.append(chunk)
-        start += size - overlap
-    return chunks
+def page_text(page):
+    tables = page.find_tables()
+    prose_area = page
+    for table in tables:
+        prose_area = prose_area.outside_bbox(table.bbox)
+    parts = [prose_area.extract_text() or ""]
+    for table in tables:
+        for row in table.extract():
+            cells = [" ".join((cell or "").split()) for cell in row]
+            if any(cells):
+                parts.append(" | ".join(cell for cell in cells if cell))
+    return "\n".join(part for part in parts if part.strip())
 
 
 def extract_pdf(content):
@@ -36,7 +46,7 @@ def extract_pdf(content):
         pages = []
         with pdfplumber.open(handle.name) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
+                text = page_text(page)
                 if text.strip():
                     pages.append((page_number, text))
         return pages
@@ -58,27 +68,45 @@ def point_id(source, index):
     return str(UUID(digest[:32]))
 
 
+def indexed_passages(source):
+    return client.count(
+        collection_name=QDRANT_COLLECTION,
+        count_filter=Filter(
+            must=[FieldCondition(key="source_url", match=MatchValue(value=source["url"]))]
+        ),
+        exact=True,
+    ).count
+
+
 def ingest(source):
-    pages = extract_source(source)
-    text = "\n".join(text for _, text in pages)
-    chunks = chunk_text(text)
+    chunks = chunk_pages(strip_repeated_lines(extract_source(source)))
     if not chunks:
         raise ValueError("source contained no usable text")
 
-    vectors = embed(chunks)
+    vectors = embed([text for _, text in chunks])
     points = [
         PointStruct(
             id=point_id(source, index),
             vector=vector.tolist(),
             payload={
-                "text": chunk,
+                "text": text,
+                "page": page,
                 "source": source["title"],
                 "source_url": source["url"],
                 "category": source["category"],
             },
         )
-        for index, (chunk, vector) in enumerate(zip(chunks, vectors))
+        for index, ((page, text), vector) in enumerate(zip(chunks, vectors))
     ]
+
+    client.delete(
+        collection_name=QDRANT_COLLECTION,
+        points_selector=FilterSelector(
+            filter=Filter(
+                must=[FieldCondition(key="source_url", match=MatchValue(value=source["url"]))]
+            )
+        ),
+    )
     client.upsert(collection_name=QDRANT_COLLECTION, points=points)
     return len(points)
 
@@ -86,15 +114,30 @@ def ingest(source):
 def main():
     parser = argparse.ArgumentParser(description="Ingest official regulatory sources into Qdrant.")
     parser.add_argument("--config", default="src/config/sources.yaml")
+    parser.add_argument(
+        "--skip-if-indexed",
+        action="store_true",
+        help="Do nothing when every configured source already has passages.",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as handle:
         sources = yaml.safe_load(handle)["sources"]
 
     ensure_collection()
+    if args.skip_if_indexed and all(indexed_passages(source) for source in sources):
+        print("Every source is already indexed; skipping.")
+        return
+    failures = 0
     for source in sources:
-        count = ingest(source)
-        print(f'Ingested {count} chunks: {source["title"]}')
+        try:
+            count = ingest(source)
+            print(f'Ingested {count} chunks: {source["title"]}')
+        except Exception as error:
+            failures += 1
+            print(f'Failed to ingest {source["title"]}: {error}')
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

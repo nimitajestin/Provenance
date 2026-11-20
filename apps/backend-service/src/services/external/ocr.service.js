@@ -1,6 +1,18 @@
 import { supabaseAdmin } from "../../config/database.js";
 import { env } from "../../config/env.js";
-import { normalizeLineItems, normalizeQuantity } from "./normalization.js";
+import { cache } from "../../config/redis.js";
+import { logger } from "../../lib/logger.js";
+import { outboundFetch } from "../../lib/outbound.js";
+import {
+  DOCUMENT_TYPES,
+  EMPTY_DOCUMENT_LINE,
+  isQuantifiedDocumentType,
+  normalizeDocumentType,
+  normalizeLineItems,
+  normalizeQuantity,
+  parseDocumentDate,
+  resolveDocumentType,
+} from "./normalization.js";
 
 const MOCK_OCR_RESULTS = [
   {
@@ -18,31 +30,57 @@ const MOCK_OCR_RESULTS = [
 ];
 
 export const ocrService = {
-  async submitForOcr(documentId, file) {
+  async submitForOcr(documentId, file, meta = {}) {
     try {
       const result = env.USE_MOCK_SERVICES
         ? MOCK_OCR_RESULTS[0]
-        : await requestOcrService(file);
-      const items = normalizeLineItems(result);
+        : await readDocument(file, meta.file_hash);
+      const chosenType = normalizeDocumentType(meta.document_type);
+      const documentType = resolveDocumentType(chosenType, result.document_type);
+      const quantified = isQuantifiedDocumentType(documentType);
+      const items = quantified
+        ? normalizeLineItems(result).filter((item) => item.quantity > 0)
+        : [];
+      const fields = result.fields || {};
+
+      const status = !quantified
+        ? "VERIFIED"
+        : items.length > 0
+          ? "RAG_PROCESSING"
+          : "REVIEW_PENDING";
 
       const { error: updateError } = await supabaseAdmin
         .from("documents")
         .update({
           raw_text: result.raw_text,
           extracted_data: {
-            document_type: result.document_type || "unknown",
-            fields: result.fields || {},
+            document_type: documentType,
+            chosen_type: chosenType,
+            detected_type: result.document_type || "unknown",
+            file_hash: meta.file_hash || null,
+            document_date: parseDocumentDate(fields.invoice_date?.value),
+            fields,
             line_items: items,
             items,
             warnings: result.warnings || [],
             metadata: result.metadata || {},
           },
           ocr_confidence: result.confidence,
-          status: items.length > 0 ? "COMPLETED" : "REVIEW_PENDING",
-          requires_human_review: items.length === 0 || Boolean(result.warnings?.length),
-          reasoning: items.length > 0
-            ? "Items extracted via OCR and ready for material classification."
-            : "OCR completed without extracting line items; manual review is required.",
+          status,
+          verified_by_user: !quantified,
+          requires_human_review: quantified,
+          reasoning: [
+            documentType !== chosenType
+              ? `Read as a ${DOCUMENT_TYPES[documentType].toLowerCase()} from its contents, not a ${DOCUMENT_TYPES[chosenType].toLowerCase()}.`
+              : null,
+            !quantified
+              ? "Stored as supporting evidence. No quantities are taken from this document."
+              : items.length > 0
+                ? "Line items extracted and sent for material classification."
+                : "No line items with quantities were found. Add them during review or delete the document.",
+          ]
+            .filter(Boolean)
+            .join(" "),
           updated_at: new Date().toISOString(),
         })
         .eq("id", documentId);
@@ -51,27 +89,28 @@ export const ocrService = {
         throw new Error(`OCR result update failed: ${updateError.message}`);
       }
 
-      const classifications = items
-        .filter((item) => item.quantity > 0)
-        .map((item) => ({
-          document_id: documentId,
-          material_code: null,
-          quantity_kg: normalizeQuantity(item),
-          confidence_score: 0,
-          reasoning: `Extracted from OCR: "${item.description}"`,
-          matched_synonym: item.description,
-          requires_human_review: true,
-          verified_by_user: false,
-        }));
+      await supabaseAdmin.from("document_classifications").delete().eq("document_id", documentId);
 
-      if (items.length === 0) {
+      const classifications = items.map((item) => ({
+        document_id: documentId,
+        material_code: null,
+        quantity_kg: normalizeQuantity(item),
+        confidence_score: 0,
+        reasoning: "Awaiting material classification.",
+        matched_synonym: item.description,
+        requires_human_review: true,
+        verified_by_user: false,
+      }));
+
+      if (quantified && items.length === 0) {
         classifications.push({
           document_id: documentId,
           material_code: null,
           quantity_kg: null,
           confidence_score: 0,
-          reasoning: "No line items were extracted from the document.",
-          matched_synonym: null,
+          reasoning:
+            "No line items were extracted. Enter the material and quantity from the document, or exclude it.",
+          matched_synonym: EMPTY_DOCUMENT_LINE,
           requires_human_review: true,
           verified_by_user: false,
         });
@@ -86,22 +125,20 @@ export const ocrService = {
         }
       }
 
-      console.log(`[OCR] Document ${documentId} processed successfully`);
+      logger.info("ocr complete", { document_id: documentId, lines: items.length });
       return { ...result, line_items: items };
     } catch (error) {
-      console.error(`[OCR] Failed for document ${documentId}:`, error);
-      await supabaseAdmin
-        .from("documents")
-        .update({
-          status: "OCR_FAILED",
-          reasoning: error.message,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", documentId);
-      throw error;
+      logger.error("ocr failed", { document_id: documentId, error });
+      throw new Error(`Text extraction failed: ${error.message}`, { cause: error });
     }
   },
 };
+
+const OCR_CACHE_SECONDS = 24 * 3600;
+const readDocument = (file, fileHash) =>
+  fileHash
+    ? cache.wrap(cache.key("ocr", "v2", fileHash), OCR_CACHE_SECONDS, () => requestOcrService(file))
+    : requestOcrService(file);
 
 const requestOcrService = async (file) => {
   if (!env.OCR_SERVICE_URL) {
@@ -109,19 +146,20 @@ const requestOcrService = async (file) => {
   }
 
   const form = new FormData();
-  form.append(
-    "file",
-    new Blob([file.buffer], { type: file.mimetype }),
-    file.originalname,
-  );
+  form.append("file", new Blob([file.buffer], { type: file.mimetype }), file.originalname);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), env.OCR_TIMEOUT_MS);
 
   try {
-    const response = await fetch(
+    const response = await outboundFetch(
+      "ocr",
       `${env.OCR_SERVICE_URL.replace(/\/$/, "")}/v1/ocr`,
-      { method: "POST", body: form, signal: controller.signal },
+      {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      },
     );
     const payload = await response.json().catch(() => ({}));
 
@@ -132,6 +170,9 @@ const requestOcrService = async (file) => {
     }
     return payload;
   } catch (error) {
+    if (error.cause?.code === "ECONNREFUSED" || error.cause?.code === "ENOTFOUND") {
+      throw new Error("can't reach the OCR service", { cause: error });
+    }
     if (error.name === "AbortError") {
       throw new Error(`OCR service timed out after ${env.OCR_TIMEOUT_MS}ms`);
     }

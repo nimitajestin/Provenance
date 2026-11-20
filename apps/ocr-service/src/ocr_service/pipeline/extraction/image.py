@@ -9,8 +9,6 @@ from ocr_service.pipeline.extraction.preprocess import preprocess_image
 
 @lru_cache(maxsize=1)
 def _get_ocr_engine():
-    # Import lazily so native-PDF extraction and API health checks do not need
-    # to initialize the heavyweight OCR model.
     from paddleocr import PaddleOCR
 
     return PaddleOCR(
@@ -25,11 +23,14 @@ def _get_ocr_engine():
     )
 
 
-def extract_ocr_tokens(images: list[Image.Image]) -> list[dict]:
+def extract_ocr_tokens(
+    images: list[Image.Image], page_numbers: list[int] | None = None
+) -> list[dict]:
     ocr = _get_ocr_engine()
     tokens: list[dict] = []
+    page_numbers = page_numbers or list(range(len(images)))
 
-    for page_number, image in enumerate(images):
+    for page_number, image in zip(page_numbers, images):
         processed = preprocess_image(image)
         result = ocr.ocr(np.array(processed), cls=True)
         lines = result[0] if result and result[0] else []

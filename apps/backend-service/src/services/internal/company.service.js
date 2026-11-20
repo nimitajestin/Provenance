@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../../config/database.js";
+import { workspaceCache } from "./workspace.cache.js";
 
 export const createCompany = async (userId, data) => {
   const { data: result, error } = await supabaseAdmin
@@ -15,6 +16,7 @@ export const createCompany = async (userId, data) => {
     .single();
 
   if (error) throw error;
+  await workspaceCache.forgetCompany(userId);
   return result;
 };
 
@@ -23,6 +25,7 @@ export const updateCompany = async (userId, updates) => {
     "company_name",
     "gst_number",
     "Pibo_category",
+    "epr_registration_number",
     "onboarding_completed",
   ];
   const filteredUpdates = {};
@@ -43,6 +46,7 @@ export const updateCompany = async (userId, updates) => {
     .single();
 
   if (error) throw error;
+  await workspaceCache.forgetCompany(userId);
   return result;
 };
 

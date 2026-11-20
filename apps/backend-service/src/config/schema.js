@@ -1,0 +1,59 @@
+import { supabaseAdmin } from "./database.js";
+import { logger } from "../lib/logger.js";
+
+const capabilities = {
+  fyFilings: false,
+  classificationCategory: false,
+  reviewerIdentity: false,
+  activityLog: false,
+  obligations: false,
+  tradeNames: false,
+};
+
+let detected = null;
+
+const probe = async (table, columns) => {
+  const { error } = await supabaseAdmin.from(table).select(columns).limit(1);
+  return !error;
+};
+
+export const detectSchema = async () => {
+  const [
+    fyFilings,
+    classificationCategory,
+    reviewerIdentity,
+    activityLog,
+    obligations,
+    tradeNames,
+  ] = await Promise.all([
+    probe("fy_filings", "id"),
+    probe("document_classifications", "cpcb_category, corrected_cpcb_category"),
+    probe("document_classifications", "reviewed_by, reviewed_by_name, reviewed_at"),
+    probe("activity_events", "id"),
+    probe("epr_obligation_inputs", "id"),
+    probe("company_trade_names", "id"),
+  ]);
+  capabilities.fyFilings = fyFilings;
+  capabilities.classificationCategory = classificationCategory;
+  capabilities.reviewerIdentity = reviewerIdentity;
+  capabilities.activityLog = activityLog;
+  capabilities.obligations = obligations;
+  capabilities.tradeNames = tradeNames;
+
+  const missing = Object.entries(capabilities)
+    .filter(([, available]) => !available)
+    .map(([name]) => name);
+  if (missing.length) {
+    logger.warn("missing optional schema, apply supabase/migrations to enable it", { missing });
+  }
+  return capabilities;
+};
+
+export const schema = async () => {
+  detected ??= detectSchema().catch((error) => {
+    detected = null;
+    logger.error("schema detection failed", { error });
+    return capabilities;
+  });
+  return detected;
+};

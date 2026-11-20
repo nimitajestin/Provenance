@@ -1,0 +1,180 @@
+name: infra
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "${QDRANT_PORT}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "${OLLAMA_PORT}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  rag-classify:
+    build:
+      context: ../../apps/rag-classify
+    env_file:
+      - ../../apps/rag-classify/.env
+    environment:
+      QDRANT_HOST: ${QDRANT_HOST}
+      QDRANT_PORT: 6333
+      OLLAMA_HOST: ${OLLAMA_HOST}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+    volumes:
+      - model_cache:/root/.cache/huggingface
+    ports:
+      - "${CLASSIFIER_PORT}:8001"
+    depends_on:
+      - qdrant
+      - ollama
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+
+  rag-regulatory:
+    build:
+      context: ../../apps/rag-regulatory
+    environment:
+      QDRANT_HOST: ${QDRANT_HOST}
+      QDRANT_PORT: 6333
+      QDRANT_COLLECTION: regulatory_docs
+      OLLAMA_HOST: ${OLLAMA_HOST}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      CORS_ORIGINS: ${CORS_ORIGIN}
+    volumes:
+      - model_cache:/root/.cache/huggingface
+    ports:
+      - "${REGULATORY_PORT}:8002"
+    depends_on:
+      - qdrant
+      - ollama
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health')"
+      interval: 30s
+      timeout: 10s
+      start_period: 45s
+      retries: 5
+    restart: unless-stopped
+
+  ocr-service:
+    build:
+      context: ../../apps/ocr-service
+    ports:
+      - "${OCR_PORT}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../../apps/backend-service
+    env_file:
+      - ../../apps/backend-service/.env.development
+    environment:
+      PORT: 3000
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      FRONTEND_URL: ${FRONTEND_URL}
+      OCR_SERVICE_URL: ${OCR_SERVICE_URL}
+      RAG_SERVICE_URL: ${RAG_SERVICE_URL}
+      REGULATORY_RAG_URL: ${REGULATORY_RAG_URL}
+      REGULATORY_RAG_TIMEOUT_MS: 180000
+      USE_MOCK_SERVICES: "false"
+      REDIS_URL: ${REDIS_URL}
+      OLLAMA_HOST: ${OLLAMA_HOST}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      EPR_PORTAL_URL: ${EPR_PORTAL_URL}
+      EPR_GUIDANCE_MANUAL_URL: ${EPR_GUIDANCE_MANUAL_URL}
+    ports:
+      - "${BACKEND_PORT}:3000"
+    volumes:
+      - backend_uploads:/app/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+      ocr-service:
+        condition: service_healthy
+      rag-classify:
+        condition: service_healthy
+      rag-regulatory:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --tries=1
+        - --spider
+        - http://127.0.0.1:3000/health
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../../apps/web-app
+    env_file:
+      - ../../apps/web-app/.env.development
+    environment:
+      VITE_API_URL: ${PUBLIC_API_URL}
+      VITE_SITE_URL: ${FRONTEND_URL}
+      VITE_EPR_PORTAL_URL: ${EPR_PORTAL_URL}
+    ports:
+      - "${FRONTEND_PORT}:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  qdrant_data:
+  ollama_data:
+  model_cache:
+  backend_uploads:
+
+networks:
+  default:
+    name: provenance

@@ -2,6 +2,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { env } from "../config/env.js";
+import { AppError } from "../utils/errors.js";
 
 const uploadDir = env.UPLOAD_TEMP_DIR || "./uploads";
 
@@ -17,27 +18,22 @@ const storage = multer.diskStorage({
     const userId = req.user?.id || "anonymous";
     const timestamp = Date.now();
     const ext = path.extname(file.originalname);
-    const safeName = path
-      .basename(file.originalname, ext)
-      .replace(/[^a-zA-Z0-9]/g, "_");
+    const safeName = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9]/g, "_");
     cb(null, `${userId}-${timestamp}-${safeName}${ext}`);
   },
 });
 
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = [
-    "application/pdf",
-    "image/jpeg",
-    "image/png",
-    "image/tiff",
-  ];
+  const allowedTypes = ["application/pdf", "image/jpeg", "image/png", "image/tiff"];
 
   if (allowedTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
     cb(
-      new Error(
-        "Invalid file type. Only PDF, JPEG, PNG, and TIFF files are allowed.",
+      new AppError(
+        415,
+        "Unsupported file type. Upload a PDF, JPG, PNG, or TIFF file.",
+        "UNSUPPORTED_FILE",
       ),
       false,
     );
@@ -64,7 +60,7 @@ export const handleUploadError = (err, req, res, next) => {
   }
 
   if (err) {
-    return res.status(400).json({ success: false, message: err.message });
+    return res.status(err.status || 400).json({ success: false, message: err.message });
   }
 
   next();

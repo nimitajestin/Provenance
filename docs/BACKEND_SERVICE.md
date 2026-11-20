@@ -1,86 +1,181 @@
-# Backend Service
+# Backend service
 
-`apps/backend-service` is the orchestration API for the document workflow:
+`apps/backend-service` is the Express API the web app talks to. It is the only component that writes application data. It authenticates requests, enforces the filing rules, stores files, and orchestrates OCR and classification.
+
+## Layout
 
 ```text
-frontend upload -> backend -> Supabase Storage -> OCR service -> RAG classifier -> review
+src/
+  app.js, server.js        Express app, startup (schema probe, interrupted-work recovery)
+  config/                  env.js (validated settings), database.js (Supabase clients), schema.js (optional-schema probe)
+  middleware/              auth (Bearer JWT), upload (multer, 10 MB), errors
+  routes/, controllers/    HTTP layer: parse, validate, call a service, shape the response
+  services/
+    internal/              document, feedback (review), compliance (filing), company
+                           filing.summary.js: pure ledger and blocker logic (unit-tested)
+                           filing.lock.js: finalized-year rules
+                           obligation.calc.js, trade-names.js: pure obligation and trade-name logic (unit-tested)
+                           activity, obligation and materials services for the workspace tools
+    external/              ocr, rag (classifier), regulatory clients; normalization.js (units, dates, FY)
+    storage.service.js     Supabase Storage
+  utils/errors.js          AppError and helpers (badRequest, notFound, conflict, …)
+test/                      node --test suites; no network or credentials needed
 ```
 
-## Local setup
+## Running
+
+The usual way is the whole stack: `make up`, `make logs s=backend`, `make rebuild s=backend`. To run it on its own with reload, see [LOCAL_DEV.md](LOCAL_DEV.md#running-one-service-outside-docker):
 
 ```bash
 cd apps/backend-service
 npm ci
-cp .env.example .env.development
-# Fill in the Supabase and service connection values
-npm run dev
+npm run dev        # http://localhost:3000, reads .env.development
+npm test
 ```
 
-The backend listens on `http://localhost:3000`. The document upload endpoint is:
+## Configuration
 
-```text
-POST /api/documents/upload
-```
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | required | Database, storage and token verification |
+| `PORT` | required | |
+| `CORS_ORIGIN` | | The web app's origin |
+| `OCR_SERVICE_URL`, `OCR_TIMEOUT_MS` | `300000` | OCR service; `http://ocr-service:8000` in Compose |
+| `RAG_SERVICE_URL`, `RAG_TIMEOUT_MS` | `180000` | Material classifier |
+| `RAG_CONCURRENCY` | `2` | Lines classified in parallel per document |
+| `REGULATORY_RAG_URL`, `REGULATORY_RAG_TIMEOUT_MS` | `180000` | Regulatory research |
+| `USE_MOCK_SERVICES` | `false` | Canned OCR and classification results, for UI work without the ML stack |
+| `EPR_PORTAL_URL`, `EPR_GUIDANCE_MANUAL_URL` | empty | CPCB links shown as the filing's sources. Omitted when empty. |
+| `OLLAMA_HOST`, `OLLAMA_MODEL` | empty | The model Trace uses; the same Ollama and model as the RAG services. Trace returns 503 while unset. |
+| `TRACE_RATE_LIMIT` | `20` | Trace questions per user per 5 minutes |
+| `LOG_LEVEL`, `LOG_FORMAT` | `info`, `json` in production and `pretty` otherwise | Log verbosity and format. See [MONITORING.md](MONITORING.md#logs). |
+| `SERVICE_NAME` | `backend` | The `service` field on log lines and the Sentry tag. The chart sets `worker` for the worker. |
+| `METRICS_PORT` | `9464` | The worker's `/metrics` port. The API serves `/metrics` on `PORT`. |
+| `SENTRY_DSN`, `SENTRY_ENVIRONMENT` | empty, `NODE_ENV` | Error reporting to Sentry. Off while the DSN is empty. |
+| `TRUST_PROXY` | `0` | Reverse proxies in front of the API (`1` behind the ingress). Sets which address counts as the client's. |
+| `RATE_LIMIT_ENABLED` | `true` | `false` turns every rate limit and the processing cap off (benchmarks, load tests) |
+| `RATE_LIMIT_*`, `MAX_PENDING_DOCUMENTS` | see below | Limits per route; the full list is in [Rate limits](#rate-limits) |
+| `REDIS_URL` | empty | Queue and cache; `redis://redis:6379` in Compose. Empty processes documents in the API process with no cache. |
+| `PROCESSING_CONCURRENCY` | `2` | Documents processed at once |
+| `PROCESSING_ATTEMPTS` | `3` | Attempts before a document is marked failed |
+| `RUN_WORKER` | `true` | `false` makes the process API-only; run `npm run worker` alongside it |
+| `ADMIN_USER`, `ADMIN_PASSWORD` | empty | Login for the queue dashboard at `/admin/queues`; it's off while either is empty |
 
-It expects an authenticated multipart request with the field name `file`. Supported files currently match the OCR service: PDF, JPEG, PNG, and TIFF, up to 10 MB.
+The environment file is chosen by `NODE_ENV`: `.env.development` by default, `.env.production` with `npm start`.
 
-## OCR connection
+## Rate limits
 
-Set these values in the active environment file:
+Limits are counted in Redis, per signed-in user where the route needs a sign-in and per network address where it doesn't. Counters use fixed windows, are shared by every API pod, and fail open: if Redis is unavailable, requests are allowed rather than blocked. A refused request gets `429` with `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers, and a body of `{ success: false, code: "RATE_LIMITED", message, details: { retry_after_seconds } }`. The web app shows the message as it does any other error.
 
-```dotenv
-OCR_SERVICE_URL=http://localhost:8000
-OCR_TIMEOUT_MS=120000
-USE_MOCK_SERVICES=false
-```
+Every route also sits behind the ingress limits (`ingress.rateLimit` in the Helm values), which stop floods before they reach Node.
 
-When the upload is accepted, the backend stores the file, creates a `PENDING` document, and asynchronously sends the file bytes to `POST /v1/ocr`. The OCR response is persisted in `documents.raw_text` and `documents.extracted_data`. Material classification starts only after the OCR response is received.
+| Limit | Applies to | Default | Variable |
+| --- | --- | --- | --- |
+| Per address | every `/api` route, before sign-in is checked | 600 per minute | `RATE_LIMIT_IP` |
+| Sign-in sync | `POST /api/auth/sync`, per address | 20 per 10 minutes | `RATE_LIMIT_AUTH_SYNC` |
+| Per user | every signed-in route | 300 per minute | `RATE_LIMIT_USER` |
+| Changes | every `POST`, `PUT`, `PATCH` and `DELETE` | 120 per minute | `RATE_LIMIT_WRITES` |
+| Upload | `POST /api/documents/upload` | 30 per hour | `RATE_LIMIT_UPLOAD` |
+| Upload burst | the same route | 10 per minute | `RATE_LIMIT_UPLOAD_BURST` |
+| Processing cap | uploads and retries, while that many documents are still processing | 25 documents | `MAX_PENDING_DOCUMENTS` |
+| Retry | `POST /api/documents/:id/retry` | 20 per 10 minutes | `RATE_LIMIT_RETRY` |
+| Bulk approve | `POST /api/feedback/approve-suggested` | 20 per 10 minutes | `RATE_LIMIT_BULK_APPROVE` |
+| Finalize and reopen | `POST /api/compliance/filing/finalize` and `/reopen`, shared | 10 per 10 minutes | `RATE_LIMIT_FILING` |
+| Regulatory question | `POST /api/regulatory/query` | 20 per 5 minutes | `RATE_LIMIT_REGULATORY` |
+| Regulatory review | `POST /api/compliance/filing/regulatory-review` | 10 per 10 minutes | `RATE_LIMIT_REGULATORY_REVIEW` |
+| Trace | `POST /api/trace/chat` | 20 per 5 minutes | `TRACE_RATE_LIMIT` |
+| System status | `GET /api/system/status` | 30 per minute | `RATE_LIMIT_STATUS` |
+| Queue dashboard login | failed logins at `/admin/queues`, per address; locks the address out for 5 minutes | 10 failures | `RATE_LIMIT_ADMIN_FAILURES` |
 
-For Docker networking, use the OCR container service name instead of `localhost`, for example `http://ocr-service:8000`.
+Rejected uploads cost nothing: the limits run before the file is written to disk.
 
-## RAG classifier connection
+The code is in `src/lib/rate-limit.js` (the counter), `src/middleware/rate-limit.middleware.js` (the rules) and `src/middleware/queue-limit.middleware.js` (the processing cap).
 
-The backend sends each extracted OCR line item to `POST /classify` on the RAG classifier. The backend owns persistence in Supabase and stores the classifier's material code, confidence, reasoning, matched synonym, vector similarity, and normalized quantity.
+## API
 
-For local Node development with the classifier running through the shared infra compose:
+Every route except `GET /health` needs `Authorization: Bearer <Supabase access token>`. Responses are `{ success, data, … }`; errors are `{ success: false, message, code?, details? }` with a proper 4xx status.
 
-```dotenv
-RAG_SERVICE_URL=http://localhost:8001
-RAG_TIMEOUT_MS=180000
-```
+### Account and company
 
-For a backend container attached to the same Docker network as the classifier, use the Compose service hostname:
+| Method | Path | Does |
+| --- | --- | --- |
+| `POST` | `/api/auth/sync` | Called after sign-in; makes sure the company row exists |
+| `GET` | `/api/auth/me` | Current user and company |
+| `POST` | `/api/auth/logout` | |
+| `GET` | `/api/company/me` | The caller's company |
+| `POST`, `PATCH` | `/api/company` | Create or update the profile: name, GSTIN, PIBO categories, EPR registration number (validated) |
 
-```dotenv
-RAG_SERVICE_URL=http://rag-classify:8001
-```
+### Documents
 
-The document status flow is:
+| Method | Path | Does |
+| --- | --- | --- |
+| `POST` | `/api/documents/upload` | Multipart: `file`, plus `document_type` (`purchase_invoice`, `recycling_certificate`, `collection_receipt` or `epr_record`). Returns at once; processing continues in the background. |
+| `GET` | `/api/documents` | List with stage, financial year, line counts and filing position |
+| `GET` | `/api/documents/:id` | Detail with lines, OCR text and a 10-minute signed file URL |
+| `PATCH` | `/api/documents/:id` | Set `document_date`, which moves the document to that date's financial year |
+| `POST` | `/api/documents/:id/retry` | Re-run processing for a failed document |
+| `DELETE` | `/api/documents/:id` | Delete the document, its lines and the stored file |
 
-```text
-PENDING -> OCR_PROCESSING -> RAG_PROCESSING -> VERIFIED
-                                      \-> CLASSIFIED (human review required)
-                                      \-> RAG_FAILED
-```
+### Review
 
-`VERIFIED` means every classification cleared the review threshold. `CLASSIFIED` means at least one result needs human review.
+| Method | Path | Does |
+| --- | --- | --- |
+| `GET` | `/api/feedback/queue?document_id=` | Lines waiting for a decision, each with a `suggested` flag and lock state |
+| `POST` | `/api/feedback/:id/approve` | Accept the suggestion as is |
+| `POST` | `/api/feedback/:id/correct` | `{ material_code, quantity_kg, cpcb_category?, notes? }`, then approve |
+| `POST` | `/api/feedback/:id/exclude` | `{ reason }`: kept on record, counts toward nothing |
+| `POST` | `/api/feedback/lines` | `{ document_id, description, material_code, quantity_kg, cpcb_category?, notes? }`: adds a row the reader missed, already approved by the reviewer. Removes the "no line items detected" placeholder. Refused for EPR records and finalized years |
+| `POST` | `/api/feedback/approve-suggested` | Approve every complete, high-confidence line (optionally for one document) |
 
-## Docker
+### Filing and research
 
-Build and run the backend container from the service directory:
+| Method | Path | Does |
+| --- | --- | --- |
+| `GET` | `/api/compliance/filing?fy=2026` | Totals, blockers, warnings, documents, status, snapshot and late documents for the year (start year) |
+| `POST` | `/api/compliance/filing/finalize` | `{ fy, notes? }`: store the snapshot. `409` if blockers remain. |
+| `POST` | `/api/compliance/filing/reopen` | `{ fy }`: remove the snapshot |
+| `POST` | `/api/compliance/filing/regulatory-review` | `{ fy }`: ask the regulatory service to review the year's position |
+| `POST` | `/api/regulatory/query` | `{ query }`: an answer with source passages |
+| `GET` | `/api/regulatory/sources` | The indexed source documents |
+| `GET` | `/api/system/status` | Service reachability and which optional schema features are on |
 
-```bash
-cd apps/backend-service
-docker build -t provenance-backend .
-docker run --rm --name provenance-backend -p 3000:3000 \
-  --env-file .env.development \
-  -e OCR_SERVICE_URL=http://host.docker.internal:8000 \
-  -e RAG_SERVICE_URL=http://host.docker.internal:8001 \
-  provenance-backend
-```
+### Trace
 
-The `host.docker.internal` value lets the backend container reach OCR and RAG services running on the host machine. In a shared Docker Compose network, use their service hostnames instead.
+| Method | Path | Does |
+| --- | --- | --- |
+| `POST` | `/api/trace/chat` | `{ message, history?, context: { page, fy, documentId? } }`. Streams server-sent events: `token` (`{ text }`) as the answer is written, then `done` (`{ links, sources }`) or `error` (`{ message }`). Read-only. `429` past the rate limit. |
 
-## Hygiene
+### Workspace tools
 
-Runtime uploads, local environment files, `node_modules`, and operating-system metadata are ignored by the root `.gitignore`. Do not commit `.env.development`, `.env.production`, `uploads/`, or `node_modules/`.
+| Method | Path | Does |
+| --- | --- | --- |
+| `GET` | `/api/activity?fy=2026&group=review&before=…&limit=50` | Audit trail, newest first. `fy=all` for every year; `group` is `documents`, `review`, `filing` or `settings`; page with `before` = the previous page's `next_before`. |
+| `GET` | `/api/obligations?fy=2026&basis=current` | Obligation per CPCB category. `basis=previous_two_years` averages A over the two years before. |
+| `PUT` | `/api/obligations/:category` | `{ fy, pre_consumer_kg?, supplied_kg?, epr_target_pct?, recycling_min_pct?, ec_rate_per_kg? }`. `null` clears a value back to the default. `409` for finalized years. |
+| `GET` | `/api/materials` | Polymers, the built-in catalogue, the company's trade names, and suggestions from its review corrections |
+| `POST` | `/api/materials/trade-names` | `{ trade_name, material_code, cpcb_category?, notes? }`. `409` if the name exists (ignoring case). |
+| `DELETE` | `/api/materials/trade-names/:id` | Remove one of the company's trade names |
+
+## Business rules
+
+Rules are enforced here, not in the UI, and the database lets clients read only (see [DATABASE.md](DATABASE.md#row-level-security)).
+
+- **Duplicates.** The same file (by SHA-256) can't be uploaded twice per company. The `409` response names the existing file and its financial year. A unique index catches simultaneous uploads.
+- **Document type.** The type chosen at upload is kept unless the OCR service reads a recycling certificate, collection receipt or EPR record from the heading, in which case that type wins and the document's reasoning says so. Review wording follows the type: invoice lines count toward plastic introduced, certificate lines toward recycled, receipt lines toward collected.
+- **Review.** Only a person marks a line verified. Approving needs a material and a weight in kg. Every decision stores the reviewer's id, name and time. A correction that changes the suggestion is also logged to `classification_feedback`.
+- **Financial year.** A document belongs to the FY of its invoice date, otherwise its upload date. See [ARCHITECTURE.md](ARCHITECTURE.md#filing-model) for the ledger, blockers and warnings.
+- **Finalized years.** These are read-only. Review actions, date changes, retries, and deletes of documents in the snapshot return `409` until the year is reopened. A document can't be moved into a finalized year either.
+- **Late documents.** A document dated in a finalized year but not in its snapshot is flagged. It can't be reviewed until the year is reopened, but it can be deleted.
+- **Audit trail.** Uploads, deletes, retries, date changes, every review decision, bulk approvals, finalize and reopen, profile changes, obligation inputs and trade names each record an `activity_events` row. Recording never fails the action itself.
+- **Trade names.** Before classification, each line is matched against the company's trade names (whole words, case and punctuation ignored, longest name wins). A match is suggested with confidence 0.95 and still needs approval; without a category it stays out of bulk approval.
+- **Processing.** Uploads and retries queue a job (see [ARCHITECTURE.md](ARCHITECTURE.md#the-processing-queue)). A queued document can be deleted; one being read right now can't, and neither can be retried until it finishes.
+
+## Adding an endpoint
+
+1. **Route.** Add it in `routes/`, behind `authenticate`.
+2. **Controller.** The controller reads `req.user.id` (the company id) and passes plain values to a service.
+3. **Service.**
+   - Scope every query with `.eq("company_id", userId)` or an inner join to `documents`.
+   - Throw `AppError` helpers (`badRequest`, `notFound`, `conflict`, `unprocessable`) for expected failures.
+   - Call `assertDocumentEditable` before changing anything tied to a financial year.
+4. **Tests.** Put pure logic in its own module and test it in `test/` without importing the Supabase client; CI has no credentials.

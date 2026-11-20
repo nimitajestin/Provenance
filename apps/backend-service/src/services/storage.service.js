@@ -1,4 +1,6 @@
 import { supabaseAdmin } from "../config/database.js";
+import { cache } from "../config/redis.js";
+import { digest } from "../lib/cache-keys.js";
 import fs from "fs/promises";
 import path from "path";
 
@@ -21,9 +23,7 @@ export const storageService = {
   async uploadFile(localFilePath, userId, originalName) {
     const ext = path.extname(originalName);
     const timestamp = Date.now();
-    const safeName = path
-      .basename(originalName, ext)
-      .replace(/[^a-zA-Z0-9]/g, "_");
+    const safeName = path.basename(originalName, ext).replace(/[^a-zA-Z0-9]/g, "_");
     const storagePath = `${userId}/${timestamp}-${safeName}${ext}`;
 
     const fileBuffer = await fs.readFile(localFilePath);
@@ -31,8 +31,7 @@ export const storageService = {
     const { error } = await supabaseAdmin.storage
       .from(BUCKET_NAME)
       .upload(storagePath, fileBuffer, {
-        contentType:
-          CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream",
+        contentType: CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream",
         upsert: false,
       });
 
@@ -44,19 +43,32 @@ export const storageService = {
   },
 
   async getSignedUrl(storagePath, expiresInSeconds = 3600) {
-    const { data, error } = await supabaseAdmin.storage
-      .from(BUCKET_NAME)
-      .createSignedUrl(storagePath, expiresInSeconds);
+    const reuseFor = expiresInSeconds - 120;
+    const create = async () => {
+      const { data, error } = await supabaseAdmin.storage
+        .from(BUCKET_NAME)
+        .createSignedUrl(storagePath, expiresInSeconds);
+      if (error) throw new Error(`Failed to create signed URL: ${error.message}`);
+      return data.signedUrl;
+    };
+    if (reuseFor < 30) return create();
+    return cache.wrap(
+      cache.key("signed", expiresInSeconds, digest(storagePath, 32)),
+      reuseFor,
+      create,
+    );
+  },
 
-    if (error) throw new Error(`Failed to create signed URL: ${error.message}`);
+  async downloadFile(storagePath) {
+    const { data, error } = await supabaseAdmin.storage.from(BUCKET_NAME).download(storagePath);
 
-    return data.signedUrl;
+    if (error) throw new Error(`Failed to download file: ${error.message}`);
+
+    return Buffer.from(await data.arrayBuffer());
   },
 
   async deleteFile(storagePath) {
-    const { error } = await supabaseAdmin.storage
-      .from(BUCKET_NAME)
-      .remove([storagePath]);
+    const { error } = await supabaseAdmin.storage.from(BUCKET_NAME).remove([storagePath]);
 
     if (error) throw new Error(`Failed to delete file: ${error.message}`);
   },

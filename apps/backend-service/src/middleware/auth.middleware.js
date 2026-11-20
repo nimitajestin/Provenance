@@ -1,30 +1,58 @@
 import { supabaseAdmin } from "../config/database.js";
+import { cache } from "../config/redis.js";
+import { hashToken, tokenCacheSeconds } from "../lib/tokens.js";
+import { setContext } from "../lib/context.js";
+import { companyCacheKey } from "../services/internal/workspace.cache.js";
+
+const COMPANY_CACHE_SECONDS = 300;
+
+const readToken = (req) => {
+  const header = req.headers.authorization;
+  return header?.startsWith("Bearer ") ? header.slice(7).trim() || null : null;
+};
+
+export const authCacheKey = (token) => cache.key("auth", "v1", hashToken(token));
+
+const verifiedUser = async (token) => {
+  const key = authCacheKey(token);
+  const cached = await cache.get(key);
+  if (cached) return cached;
+
+  const {
+    data: { user },
+    error,
+  } = await supabaseAdmin.auth.getUser(token);
+  if (error || !user) return null;
+
+  const meta = user.user_metadata || {};
+  const identity = {
+    id: user.id,
+    email: user.email,
+    name: meta.full_name || meta.name || null,
+  };
+  const seconds = tokenCacheSeconds(token);
+  if (seconds > 0) await cache.set(key, identity, seconds);
+  return identity;
+};
+
+const loadCompany = (companyId) =>
+  cache.wrap(
+    companyCacheKey(companyId),
+    COMPANY_CACHE_SECONDS,
+    async () => {
+      const { data } = await supabaseAdmin
+        .from("companies")
+        .select("*")
+        .eq("id", companyId)
+        .maybeSingle();
+      return data || null;
+    },
+    { shouldCache: Boolean },
+  );
 
 export const authenticate = async (req, res, next) => {
   try {
-    const userId = req.headers["x-user-id"];
-    const userEmail = req.headers["x-user-email"];
-    const gatewayVerified = req.headers["x-gateway-verified"];
-
-    if (userId && gatewayVerified === "true") {
-      req.user = { id: userId, email: userEmail };
-
-      const { data: company, error: companyError } = await supabaseAdmin
-        .from("companies")
-        .select("*")
-        .eq("id", userId)
-        .single();
-
-      if (companyError && companyError.code !== "PGRST116") {
-        throw companyError;
-      }
-
-      req.company = company || null;
-      return next();
-    }
-
-    const token =
-      req.cookies?.token || req.headers.authorization?.split(" ")[1];
+    const token = readToken(req);
 
     if (!token) {
       return res.status(401).json({
@@ -33,29 +61,19 @@ export const authenticate = async (req, res, next) => {
       });
     }
 
-    const {
-      data: { user },
-      error,
-    } = await supabaseAdmin.auth.getUser(token);
-
-    if (error || !user) {
+    const user = await verifiedUser(token);
+    if (!user) {
       return res.status(401).json({
         success: false,
         message: "Invalid or expired token",
       });
     }
 
-    req.user = { id: user.id, email: user.email };
-
-    const { data: company } = await supabaseAdmin
-      .from("companies")
-      .select("*")
-      .eq("id", user.id)
-      .single();
-
-    req.company = company || null;
+    req.user = user;
+    setContext({ userId: user.id });
+    req.company = await loadCompany(user.id);
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({
       success: false,
       message: "Authentication failed",

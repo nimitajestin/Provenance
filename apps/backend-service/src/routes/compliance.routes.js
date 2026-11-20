@@ -1,26 +1,19 @@
 import { Router } from "express";
 import { authenticate } from "../middleware/auth.middleware.js";
+import { accountLimits, limits } from "../middleware/rate-limit.middleware.js";
 import { complianceController } from "../controllers/compliance.controller.js";
 
 const router = Router();
 
-router.use(authenticate);
+router.use(authenticate, accountLimits);
 
-router.get("/filings", complianceController.listFilings);
-router.get("/filings/current", complianceController.getCurrent);
-router.get("/filings/:id", complianceController.getFiling);
-router.get("/filings/:id/documents", complianceController.getFilingDocuments);
-router.post("/filings/:id/submit", complianceController.submitFiling);
-router.get("/dashboard/stats", complianceController.getDashboardStats);
-router.get(
-  "/dashboard/recent-activity",
-  complianceController.getRecentActivity,
+router.get("/filing", complianceController.getFiling);
+router.post("/filing/finalize", limits.filing, complianceController.finalize);
+router.post("/filing/reopen", limits.filing, complianceController.reopen);
+router.post(
+  "/filing/regulatory-review",
+  limits.regulatoryReview,
+  complianceController.regulatoryReview,
 );
-router.get(
-  "/reports/quarterly-summary",
-  complianceController.getQuarterlyReport,
-);
-router.get("/reports/annual", complianceController.getAnnualReport);
-router.post("/reports/regulatory-review", complianceController.getRegulatoryReview);
 
 export default router;
